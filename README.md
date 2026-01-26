@@ -5,10 +5,11 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.6+](https://img.shields.io/badge/pytorch-2.6+-green.svg)](https://pytorch.org/)
 
-📝 **[arXiv](https://arxiv.org/abs/2601.xxxxx)** |
 📄 **[Technical Report](https://github.com/Robbyant/lingbot-depth/blob/main/tech-report.pdf)** |
 🌐 **[Project Page](https://technology.robbyant.com/lingbot-depth)** |
-💻 **[Code](https://github.com/robbyant/lingbot-depth)**
+💻 **[Code](https://github.com/robbyant/lingbot-depth)** |
+🤗 **[Hugging Face](https://huggingface.co/collections/robbyant/lingbot-depth)** |
+🤖 **[ModelScope](https://www.modelscope.cn/collections/Robbyant/LingBot-Depth)**
 
 
 **LingBot-Depth** transforms incomplete and noisy depth sensor data into high-quality, metric-accurate 3D measurements. By jointly aligning RGB appearance and depth geometry in a unified latent space, our model serves as a powerful spatial perception foundation for robot learning and 3D vision applications.
@@ -30,10 +31,10 @@ Our approach refines raw sensor depth into clean, complete measurements, enablin
 
 We provide pretrained models for different scenarios:
 
-| Model | Hugging Face Model | Description |
-|-------|-----------|-------------|
-| LingBot-Depth | [robbyant/lingbot-depth-pretrain-vitl-14](https://huggingface.co/robbyant/lingbot-depth-pretrain-vitl-14/tree/main) | General-purpose depth refinement |
-| LingBot-Depth-DC | [robbyant/lingbot-depth-postrain-dc-vitl14](https://huggingface.co/robbyant/lingbot-depth-postrain-dc-vitl14/tree/main) | Optimized for sparse depth completion |
+| Model | Hugging Face Model | ModelScope Model | Description |
+|-------|-----------|-----------|-------------|
+| LingBot-Depth | [robbyant/lingbot-depth-pretrain-vitl-14](https://huggingface.co/robbyant/lingbot-depth-pretrain-vitl-14/tree/main) | [robbyant/lingbot-depth-pretrain-vitl-14](https://www.modelscope.cn/models/Robbyant/lingbot-depth-pretrain-vitl-14)| General-purpose depth refinement |
+| LingBot-Depth-DC | [robbyant/lingbot-depth-postrain-dc-vitl14](https://huggingface.co/robbyant/lingbot-depth-postrain-dc-vitl14/tree/main) | [robbyant/lingbot-depth-postrain-dc-vitl14](https://www.modelscope.cn/models/Robbyant/lingbot-depth-postrain-dc-vitl14)| Optimized for sparse depth completion |
 
 ### Data Release (Coming Soon)
 - The curated 3M RGB-D dataset will be released upon completion of the necessary licensing and approval procedures. 
