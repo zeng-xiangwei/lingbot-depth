@@ -32,8 +32,8 @@ We provide pretrained models for different scenarios:
 
 | Model | Checkpoint | Description |
 |-------|-----------|-------------|
-| LingBot-Depth | [model.pt](https://example.com/model.pt) | General-purpose depth refinement |
-| LingBot-Depth-DC | [model.pt](https://example.com/model-dc.pt) | Optimized for sparse depth completion |
+| LingBot-Depth | [robbyant/lingbot-depth/model_mdm_pretrain.pt](https://huggingface.co/robbyant/lingbot-depth/blob/main/model_mdm_pretrain.pt) | General-purpose depth refinement |
+| LingBot-Depth-DC | [robbyant/lingbot-depth/model_mdm_posttrain_dc.pt](https://huggingface.co/robbyant/lingbot-depth/blob/main/model_mdm_posttrain_dc.pt) | Optimized for sparse depth completion |
 
 ### Data Release
 The curated RGB-D dataset (3M RGB-depth pairs, including 2M real and 1M simulated samples) will be released upon completion of the necessary licensing and approval procedures. Our expected date is the mid of March.
@@ -70,7 +70,7 @@ from mdm.model.v2 import MDMModel
 
 # Load model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = MDMModel.from_pretrained('ckpt/model.pt').to(device)
+model = MDMModel.from_pretrained('robbyant/lingbot-depth/model_mdm_pretrain.pt').to(device)
 
 # Load and prepare inputs
 image = cv2.cvtColor(cv2.imread('examples/0/rgb.png'), cv2.COLOR_BGR2RGB)
