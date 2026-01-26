@@ -32,11 +32,12 @@ We provide pretrained models for different scenarios:
 
 | Model | Checkpoint | Description |
 |-------|-----------|-------------|
-| LingBot-Depth | [robbyant/lingbot-depth/model_mdm_pretrain.pt](https://huggingface.co/robbyant/lingbot-depth/blob/main/model_mdm_pretrain.pt) | General-purpose depth refinement |
-| LingBot-Depth-DC | [robbyant/lingbot-depth/model_mdm_posttrain_dc.pt](https://huggingface.co/robbyant/lingbot-depth/blob/main/model_mdm_posttrain_dc.pt) | Optimized for sparse depth completion |
+| LingBot-Depth | [model_mdm_pretrain.pt](https://huggingface.co/robbyant/lingbot-depth/blob/main/model_mdm_pretrain.pt) | General-purpose depth refinement |
+| LingBot-Depth-DC | [model_mdm_posttrain_dc.pt](https://huggingface.co/robbyant/lingbot-depth/blob/main/model_mdm_posttrain_dc.pt) | Optimized for sparse depth completion |
 
-### Data Release
-The curated RGB-D dataset (3M RGB-depth pairs, including 2M real and 1M simulated samples) will be released upon completion of the necessary licensing and approval procedures. Our expected date is the mid of March.
+### Data Release (Coming Soon)
+- The curated 3M RGB-D dataset will be released upon completion of the necessary licensing and approval procedures. 
+- Expected release: **mid-March 2026**.
 
 ## Installation
 
