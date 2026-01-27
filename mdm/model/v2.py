@@ -233,3 +233,65 @@ class MDMModel(nn.Module):
             return_dict = {k: v.squeeze(0) for k, v in return_dict.items()}
 
         return return_dict
+    
+    def forward_feat(self, 
+                image: torch.Tensor, 
+                num_tokens: Union[int, torch.LongTensor], 
+                depth: Union[None, torch.Tensor]=None, 
+                **kwargs) -> Dict[str, torch.Tensor]:
+        batch_size, _, img_h, img_w = image.shape
+        device, dtype = image.device, image.dtype
+        
+        assert depth is not None  # in this version, depth is required
+        if depth.dim() == 3:
+            depth = depth.unsqueeze(1) # from (B, H, W) to (B, 1, H, W)
+
+        aspect_ratio = img_w / img_h
+        base_h, base_w = (num_tokens / aspect_ratio) ** 0.5, (num_tokens * aspect_ratio) ** 0.5
+        if isinstance(base_h, torch.Tensor):
+            base_h, base_w = base_h.round().long(), base_w.round().long()
+        else:
+            base_h, base_w = round(base_h), round(base_w)
+
+        # Backbones encoding
+        features, cls_token, _, _ = self.encoder(image, depth, base_h, base_w, return_class_token=True, remap_depth_in=self.remap_depth_in, **kwargs)
+        
+        return features, cls_token
+
+
+    @torch.inference_mode()
+    def infer_feat(
+        self, 
+        image: torch.Tensor, 
+        depth_in: torch.Tensor = None,
+        num_tokens: int = None,
+        resolution_level: int = 9,
+        apply_mask: bool = True,
+        use_fp16: bool = True,
+        intrinsics: Optional[torch.Tensor] = None,
+        **kwargs
+    ):
+        if image.dim() == 3:
+            omit_batch_dim = True
+            image = image.unsqueeze(0)
+        else:
+            omit_batch_dim = False
+        image = image.to(dtype=self.dtype, device=self.device)
+
+        if (depth_in is not None) and (depth_in.dim() == 2):
+            depth_in = depth_in.unsqueeze(0).to(dtype=self.dtype, device=self.device)
+
+        original_height, original_width = image.shape[-2:]
+        area = original_height * original_width
+        aspect_ratio = original_width / original_height
+        
+        # Determine the number of base tokens to use
+        if num_tokens is None:
+            min_tokens, max_tokens = self.num_tokens_range
+            num_tokens = int(min_tokens + (resolution_level / 9) * (max_tokens - min_tokens))
+
+        # Forward pass
+        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=use_fp16 and self.dtype != torch.bfloat16):
+            features, cls_token = self.forward_feat(image, num_tokens=num_tokens, depth=depth_in, **kwargs)
+        
+        return features, cls_token
