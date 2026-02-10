@@ -10,6 +10,8 @@ Usage:
     python example.py --model robbyant/lingbot-depth-postrain-dc-vitl14
     python example.py --example 0 --output custom_output
 """
+import os
+os.environ['XFORMERS_DISABLED'] = '1'
 
 import cv2
 import torch
@@ -296,20 +298,29 @@ Examples:
 
         # Run inference
         print(f"\n🔄 Running inference...")
-        start_time = time.time()
-        with torch.no_grad():
-            output = model.infer(
-                image_tensor,
-                depth_in=depth_tensor,
-                apply_mask=not args.no_mask,
-                intrinsics=intrinsics_tensor
-            )
-        inference_time = time.time() - start_time
+        # Perform 10 inferences and measure timing
+        inference_times = []
+        for i in range(10):
+            start_time = time.time()
+            with torch.no_grad():
+                output = model.infer(
+                    image_tensor,
+                    depth_in=depth_tensor,
+                    apply_mask=not args.no_mask,
+                    use_fp16=True,
+                    intrinsics=intrinsics_tensor
+                )
+            inference_time = time.time() - start_time
+            inference_times.append(inference_time)
+            print(f"   Inference {i+1}: {inference_time:.3f}s")
+        
+        avg_inference_time = sum(inference_times) / len(inference_times)
+        print(f"   Average inference time: {avg_inference_time:.3f}s")
 
         depth_pred = output['depth'].squeeze().cpu().numpy()
         points_pred = output['points'].squeeze().cpu().numpy()
 
-        print(f"   ✓ Inference completed in {inference_time:.3f}s")
+        print(f"   ✓ Last inference completed in {inference_times[-1]:.3f}s")
         print(f"   Refined depth range: {depth_pred[depth_pred > 0].min():.2f} - {depth_pred.max():.2f} meters")
 
         # Save results
@@ -349,6 +360,41 @@ Examples:
         point_cloud = trimesh.PointCloud(verts, verts_color)
         point_cloud.export(output_dir / 'point_cloud.ply')
         print(f"   ✓ Point cloud saved ({len(verts):,} points)")
+
+         # 5. Save original depth point cloud
+        # Calculate original depth point cloud from raw depth
+        fx, fy = intrinsics[0, 0] * w, intrinsics[1, 1] * h
+        cx, cy = intrinsics[0, 2] * w, intrinsics[1, 2] * h
+        
+        # Create coordinate grids
+        y_coords, x_coords = np.mgrid[0:h, 0:w]
+        
+        # Flatten coordinates and depth
+        x_flat = x_coords.flatten()
+        y_flat = y_coords.flatten()
+        z_flat = depth_np.flatten()
+        
+        # Calculate 3D points from depth
+        valid_depth_mask = (z_flat > 0) & np.isfinite(z_flat)
+        
+        x_3d = (x_flat[valid_depth_mask] - cx) * z_flat[valid_depth_mask] / fx
+        y_3d = (y_flat[valid_depth_mask] - cy) * z_flat[valid_depth_mask] / fy
+        z_3d = z_flat[valid_depth_mask]
+        
+        # Stack to get 3D coordinates
+        original_points = np.stack([x_3d, y_3d, z_3d], axis=-1)
+        
+        # Get corresponding colors
+        original_colors = image_np.reshape(-1, 3)[valid_depth_mask]
+        
+        # Downsample original point cloud
+        original_downsample = 2
+        original_points = original_points[::original_downsample]
+        original_colors = original_colors[::original_downsample]
+        
+        original_point_cloud = trimesh.PointCloud(original_points, original_colors)
+        original_point_cloud.export(output_dir / 'original_point_cloud.ply')
+        print(f"   ✓ Original point cloud saved ({len(original_points):,} points)")
 
         # Print summary
         print(f"\n📊 Summary:")

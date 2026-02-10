@@ -253,7 +253,15 @@ class NestedTensorBlock(Block):
             return super().forward(x_or_x_list)
         elif isinstance(x_or_x_list, list):
             if not XFORMERS_AVAILABLE:
-                raise AssertionError("xFormers is required for using nested tensors")
+                # Fall back to regular forward when xFormers is not available
+                # Concatenate list of tensors along batch dimension
+                x_cat = torch.cat(x_or_x_list, dim=0)
+                output = super().forward(x_cat)
+                # Split back into list
+                split_outputs = []
+                for i, x in enumerate(x_or_x_list):
+                    split_outputs.append(output[i * x.shape[0]:(i + 1) * x.shape[0]])
+                return split_outputs
             return self.forward_nested(x_or_x_list)
         else:
             raise AssertionError
