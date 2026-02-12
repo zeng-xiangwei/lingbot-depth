@@ -120,9 +120,9 @@ def _compute_depth_invalid_mask(
             
             sample_mask = torch.zeros(N, dtype=torch.bool, device=device)
             if tr is not None:
-                sample_mask |= (valid_depth_ratio[i] < tr)
+                sample_mask = torch.logical_or(sample_mask, valid_depth_ratio[i] < tr)
             if tn is not None:
-                sample_mask |= (valid_depth_num[i] < tn)
+                sample_mask = torch.logical_or(sample_mask, valid_depth_num[i] < tn)
             
             invalid_mask[i] = sample_mask
     else:
@@ -130,8 +130,8 @@ def _compute_depth_invalid_mask(
         invalid_mask = torch.zeros(B, N, dtype=torch.bool, device=device)
         
         if threshold_ratio is not None:
-            invalid_mask |= (valid_depth_ratio < threshold_ratio)
+            invalid_mask = torch.logical_or(invalid_mask, valid_depth_ratio < threshold_ratio)
         if threshold_num is not None:
-            invalid_mask |= (valid_depth_num < threshold_num)
+            invalid_mask = torch.logical_or(invalid_mask, valid_depth_num < threshold_num)
     
     return invalid_mask
