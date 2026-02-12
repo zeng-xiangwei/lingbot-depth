@@ -127,33 +127,29 @@ def build_decoder_engine(model, dummy_input, engine_path, precision='fp16'):
             features = self.model.neck(features)
             
             # Forward through heads
-            depth_reg = None
-            mask = None
-            if hasattr(self.model, 'depth_head'):
-                depth_reg = self.model.depth_head(features)[-1]
-                # Upsample to full resolution
-                if depth_reg is not None:
-                    depth_reg = F.interpolate(
-                        depth_reg, 
-                        size=self.output_size, 
-                        mode='bilinear', 
-                        align_corners=False
-                    )
-                    # Squeeze: (B, 1, H, W) -> (B, H, W)
-                    depth_reg = depth_reg.squeeze(1)
-                    # Apply remap_depth_out (exp)
-                    depth_reg = depth_reg.exp()
-            if hasattr(self.model, 'mask_head'):
-                mask = self.model.mask_head(features)[-1]
-                if mask is not None:
-                    mask = F.interpolate(
-                        mask, 
-                        size=self.output_size, 
-                        mode='bilinear', 
-                        align_corners=False
-                    )
-                    # Apply sigmoid and squeeze
-                    mask = mask.squeeze(1).sigmoid()
+            depth_reg = self.model.depth_head(features)[-1]
+            # Upsample to full resolution
+            depth_reg = F.interpolate(
+                depth_reg, 
+                size=self.output_size, 
+                mode='bilinear', 
+                align_corners=False
+            )
+            # Use reshape instead of squeeze to avoid If nodes
+            B, C, H, W = depth_reg.shape
+            depth_reg = depth_reg.reshape(B, H, W)
+            # Apply remap_depth_out (exp)
+            depth_reg = depth_reg.exp()
+            mask = self.model.mask_head(features)[-1]
+            mask = F.interpolate(
+                mask, 
+                size=self.output_size, 
+                mode='bilinear', 
+                align_corners=False
+            )
+            # Use reshape instead of squeeze
+            B, C, H, W = mask.shape
+            mask = mask.reshape(B, H, W).sigmoid()
             
             return depth_reg, mask
     
