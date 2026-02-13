@@ -53,7 +53,7 @@ def depth_to_color(depth_map, vmin=None, vmax=None):
 
 
 class SplitTensorRTEngine:
-    """Two-stage TensorRT inference."""
+    """Two-stage TensorRT inference with pre-allocated buffers."""
     
     def __init__(self, encoder_path: str, decoder_path: str):
         self.encoder_path = Path(encoder_path)
@@ -62,7 +62,7 @@ class SplitTensorRTEngine:
         self.runtime = trt.Runtime(self.logger)
         
     def load(self):
-        """Load both engines."""
+        """Load both engines and pre-allocate buffers."""
         print(f"Loading encoder: {self.encoder_path}")
         with open(self.encoder_path, 'rb') as f:
             self.encoder = self.runtime.deserialize_cuda_engine(f.read())
@@ -71,20 +71,12 @@ class SplitTensorRTEngine:
         with open(self.decoder_path, 'rb') as f:
             self.decoder = self.runtime.deserialize_cuda_engine(f.read())
         
-        print("Engines loaded.")
-        return self
-    
-    def infer(self, image_np: np.ndarray, depth_np: np.ndarray) -> Dict:
-        """Run two-stage inference."""
-        # Convert HWC to CHW
-        image_chw = np.transpose(image_np, (2, 0, 1)).astype(np.float32)
-        
-        # ===== Stage 1: Encoder =====
-        print("Running Encoder...")
-        
-        ctx = self.encoder.create_execution_context()
-        encoder_out = {}
-        bindings = []
+        # Pre-allocate encoder buffers
+        print("Pre-allocating encoder buffers...")
+        self.encoder_context = self.encoder.create_execution_context()
+        self.encoder_bindings = []
+        self.encoder_inputs = {}
+        self.encoder_outputs = {}
         
         for i in range(self.encoder.num_io_tensors):
             name = self.encoder.get_tensor_name(i)
@@ -93,36 +85,19 @@ class SplitTensorRTEngine:
             print(f"  {name}: shape={shape}, mode={mode}")
             
             tensor = torch.empty(shape, dtype=torch.float32, device='cuda')
-            bindings.append(tensor)
+            self.encoder_bindings.append(tensor)
             
             if mode == trt.TensorIOMode.INPUT:
-                if 'image' in name:
-                    tensor.copy_(torch.from_numpy(image_chw))
-                elif 'depth' in name:
-                    tensor.copy_(torch.from_numpy(depth_np[np.newaxis]))
-                elif 'base_h' in name:
-                    tensor.fill_(52)
-                elif 'base_w' in name:
-                    tensor.fill_(69)
-            
-            if mode == trt.TensorIOMode.OUTPUT:
-                encoder_out[name] = tensor
+                self.encoder_inputs[name] = tensor
+            else:
+                self.encoder_outputs[name] = tensor
         
-        # Execute
-        bindings_ptr = [t.data_ptr() for t in bindings]
-        ctx.execute_v2(bindings_ptr)
-        
-        # Get outputs
-        for name in encoder_out:
-            encoder_out[name] = encoder_out[name].cpu().numpy()
-            print(f"  Output {name}: shape={encoder_out[name].shape}")
-        
-        # ===== Stage 2: Decoder =====
-        print("Running Decoder...")
-        
-        ctx = self.decoder.create_execution_context()
-        results = {}
-        bindings = []
+        # Pre-allocate decoder buffers
+        print("Pre-allocating decoder buffers...")
+        self.decoder_context = self.decoder.create_execution_context()
+        self.decoder_bindings = []
+        self.decoder_inputs = {}
+        self.decoder_outputs = {}
         
         for i in range(self.decoder.num_io_tensors):
             name = self.decoder.get_tensor_name(i)
@@ -131,24 +106,77 @@ class SplitTensorRTEngine:
             print(f"  {name}: shape={shape}, mode={mode}")
             
             tensor = torch.empty(shape, dtype=torch.float32, device='cuda')
-            bindings.append(tensor)
+            self.decoder_bindings.append(tensor)
             
             if mode == trt.TensorIOMode.INPUT:
-                if 'features' in name and 'features' in encoder_out:
-                    tensor.copy_(torch.from_numpy(encoder_out['features']))
-                elif 'cls_token' in name and 'cls_token' in encoder_out:
-                    tensor.copy_(torch.from_numpy(encoder_out['cls_token']))
-            
-            if mode == trt.TensorIOMode.OUTPUT:
-                results[name] = tensor
+                self.decoder_inputs[name] = tensor
+            else:
+                self.decoder_outputs[name] = tensor
+        
+        print("Engines loaded and buffers pre-allocated.")
+        return self
+    
+    def infer(self, image_np: np.ndarray, depth_np: np.ndarray) -> Dict:
+        """Run two-stage inference using pre-allocated buffers."""
+        # Convert HWC to CHW
+        image_chw = np.transpose(image_np, (2, 0, 1)).astype(np.float32)
+        
+        # ===== Stage 1: Encoder =====
+        print("Running Encoder...")
+        t0 = time.time()
+        
+        # Copy data to pre-allocated buffers
+        for name, tensor in self.encoder_inputs.items():
+            if 'image' in name:
+                tensor.copy_(torch.from_numpy(image_chw))
+            elif 'depth' in name:
+                tensor.copy_(torch.from_numpy(depth_np[np.newaxis]))
+            elif 'base_h' in name:
+                tensor.fill_(52)
+            elif 'base_w' in name:
+                tensor.fill_(69)
+        
+        # Get bindings pointer list
+        bindings_ptr = [t.data_ptr() for t in self.encoder_bindings]
+        t1 = time.time()
         
         # Execute
-        bindings_ptr = [t.data_ptr() for t in bindings]
-        ctx.execute_v2(bindings_ptr)
+        self.encoder_context.execute_v2(bindings_ptr)
+        t2 = time.time()
+        print(f"Encoder: prepare {(t1-t0)*1000:.1f}ms, execute {(t2-t1)*1000:.1f}ms")
+        
+        # Get outputs - copy to CPU
+        encoder_out = {}
+        t3 = time.time()
+        for name, tensor in self.encoder_outputs.items():
+            encoder_out[name] = tensor.cpu().numpy()
+            print(f"  Output {name}: shape={encoder_out[name].shape}")
+        
+        # ===== Stage 2: Decoder =====
+        print("Running Decoder...")
+        t4 = time.time()
+        
+        # Copy encoder outputs to decoder inputs
+        for name, tensor in self.decoder_inputs.items():
+            if 'features' in name and 'features' in encoder_out:
+                tensor.copy_(torch.from_numpy(encoder_out['features']))
+            elif 'cls_token' in name and 'cls_token' in encoder_out:
+                tensor.copy_(torch.from_numpy(encoder_out['cls_token']))
+        
+        # Get bindings pointer list
+        bindings_ptr = [t.data_ptr() for t in self.decoder_bindings]
+        t5 = time.time()
+        
+        # Execute
+        self.decoder_context.execute_v2(bindings_ptr)
+        t6 = time.time()
+        print(f"Decoder: prepare {(t5-t4)*1000:.1f}ms, execute {(t6-t5)*1000:.1f}ms")
         
         # Get outputs
-        for name in results:
-            arr = results[name].cpu().numpy()
+        results = {}
+        t7 = time.time()
+        for name, tensor in self.decoder_outputs.items():
+            arr = tensor.cpu().numpy()
             # 如果是 FP16，转换为 FP32
             if arr.dtype == np.float16:
                 arr = arr.astype(np.float32)
