@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TensorRT Inference for LingBot-Depth Model
-Two-stage inference: Encoder -> Decoder
+Single Engine: Encoder + Decoder merged
 """
 import os
 os.environ['XFORMERS_DISABLED'] = '1'
@@ -22,7 +22,7 @@ try:
     print(f"TensorRT version: {trt.__version__}")
 except ImportError:
     print("Warning: TensorRT not installed.")
-
+# TENSORRT_AVAILABLE = False
 from mdm.model.v2 import MDMModel
 
 
@@ -54,140 +54,84 @@ def depth_to_color(depth_map, vmin=None, vmax=None):
     return colored
 
 
-class SplitTensorRTEngine:
-    """Two-stage TensorRT inference with pre-allocated buffers."""
+class TensorRTEngine:
+    """Single TensorRT engine for full model (Encoder + Decoder merged)."""
     
-    def __init__(self, encoder_path: str, decoder_path: str):
-        self.encoder_path = Path(encoder_path)
-        self.decoder_path = Path(decoder_path)
+    def __init__(self, engine_path: str):
+        self.engine_path = Path(engine_path)
         self.logger = trt.Logger(trt.Logger.WARNING)
         self.runtime = trt.Runtime(self.logger)
         
     def load(self):
-        """Load both engines and pre-allocate buffers."""
-        print(f"Loading encoder: {self.encoder_path}")
-        with open(self.encoder_path, 'rb') as f:
-            self.encoder = self.runtime.deserialize_cuda_engine(f.read())
+        """Load engine and pre-allocate buffers."""
+        print(f"Loading engine: {self.engine_path}")
+        with open(self.engine_path, 'rb') as f:
+            self.engine = self.runtime.deserialize_cuda_engine(f.read())
         
-        print(f"Loading decoder: {self.decoder_path}")
-        with open(self.decoder_path, 'rb') as f:
-            self.decoder = self.runtime.deserialize_cuda_engine(f.read())
+        self.context = self.engine.create_execution_context()
+        self.bindings = []
+        self.inputs = {}
+        self.outputs = {}
         
-        # Pre-allocate encoder buffers
-        print("Pre-allocating encoder buffers...")
-        self.encoder_context = self.encoder.create_execution_context()
-        self.encoder_bindings = []
-        self.encoder_inputs = {}
-        self.encoder_outputs = {}
-        
-        for i in range(self.encoder.num_io_tensors):
-            name = self.encoder.get_tensor_name(i)
-            shape = tuple(self.encoder.get_tensor_shape(name))
-            mode = self.encoder.get_tensor_mode(name)
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            shape = tuple(self.engine.get_tensor_shape(name))
+            mode = self.engine.get_tensor_mode(name)
             print(f"  {name}: shape={shape}, mode={mode}")
             
             tensor = torch.empty(shape, dtype=torch.float32, device='cuda')
-            self.encoder_bindings.append(tensor)
+            self.bindings.append(tensor)
             
             if mode == trt.TensorIOMode.INPUT:
-                self.encoder_inputs[name] = tensor
+                self.inputs[name] = tensor
             else:
-                self.encoder_outputs[name] = tensor
+                self.outputs[name] = tensor
         
-        # Pre-allocate decoder buffers
-        print("Pre-allocating decoder buffers...")
-        self.decoder_context = self.decoder.create_execution_context()
-        self.decoder_bindings = []
-        self.decoder_inputs = {}
-        self.decoder_outputs = {}
-        
-        for i in range(self.decoder.num_io_tensors):
-            name = self.decoder.get_tensor_name(i)
-            shape = tuple(self.decoder.get_tensor_shape(name))
-            mode = self.decoder.get_tensor_mode(name)
-            print(f"  {name}: shape={shape}, mode={mode}")
-            
-            tensor = torch.empty(shape, dtype=torch.float32, device='cuda')
-            self.decoder_bindings.append(tensor)
-            
-            if mode == trt.TensorIOMode.INPUT:
-                self.decoder_inputs[name] = tensor
-            else:
-                self.decoder_outputs[name] = tensor
-        
-        print("Engines loaded and buffers pre-allocated.")
+        print("Engine loaded and buffers pre-allocated.")
         return self
     
     def infer(self, image_np: np.ndarray, depth_np: np.ndarray) -> Dict:
-        """Run two-stage inference using pre-allocated buffers."""
-        # Convert HWC to CHW and normalize to [0, 1]
+        """Run inference using pre-allocated buffers."""
+        # Convert HWC to CHW
         image_chw = np.transpose(image_np, (2, 0, 1))[np.newaxis, :, :, :]
+        depth_chw = depth_np[np.newaxis, np.newaxis, :, :]
         
-        # ===== Stage 1: Encoder =====
-        print("Running Encoder...")
+        print("Running inference...")
         t0 = time.time()
         
-        # Copy data to pre-allocated buffers (only image and depth inputs)
-        for name, tensor in self.encoder_inputs.items():
+        # Copy data to pre-allocated buffers
+        for name, tensor in self.inputs.items():
             if 'image' in name:
-                tensor.copy_(torch.from_numpy(image_chw))
-                print(f"  Input {name}: shape={image_chw.shape}, min={image_chw.min():.4f}, max={image_chw.max():.4f}, mean={image_chw.mean():.4f}")
+                input_tensor = torch.from_numpy(image_chw)
+                tensor.copy_(input_tensor)
+                print(f"  Input {name}: shape={image_chw.shape}")
+                print(f"    Min: {input_tensor.min().item():.6f}, Max: {input_tensor.max().item():.6f}, Mean: {input_tensor.mean().item():.6f}")
             elif 'depth' in name:
-                depth_input = depth_np[np.newaxis, np.newaxis, :, :]
-                tensor.copy_(torch.from_numpy(depth_input))
-                print(f"  Input {name}: shape={depth_input.shape}, min={depth_input.min():.4f}, max={depth_input.max():.4f}, mean={depth_input.mean():.4f}")
+                input_tensor = torch.from_numpy(depth_chw)
+                tensor.copy_(input_tensor)
+                print(f"  Input {name}: shape={depth_chw.shape}")
+                print(f"    Min: {input_tensor.min().item():.6f}, Max: {input_tensor.max().item():.6f}, Mean: {input_tensor.mean().item():.6f}")
         
         # Get bindings pointer list
-        bindings_ptr = [t.data_ptr() for t in self.encoder_bindings]
+        bindings_ptr = [t.data_ptr() for t in self.bindings]
         t1 = time.time()
         
         # Execute
-        self.encoder_context.execute_v2(bindings_ptr)
+        self.context.execute_v2(bindings_ptr)
         t2 = time.time()
-        print(f"Encoder: prepare {(t1-t0)*1000:.1f}ms, execute {(t2-t1)*1000:.1f}ms")
-        
-        # Get outputs - copy to CPU
-        encoder_out = {}
-        t3 = time.time()
-        for name, tensor in self.encoder_outputs.items():
-            arr = tensor.cpu().numpy()
-            encoder_out[name] = arr
-            print(f"  Output {name}: shape={arr.shape}, min={arr.min():.4f}, max={arr.max():.4f}, mean={arr.mean():.4f}, dtype={arr.dtype}")
-        
-        # ===== Stage 2: Decoder =====
-        print("Running Decoder...")
-        t4 = time.time()
-        
-        # Copy encoder outputs to decoder inputs
-        for name, tensor in self.decoder_inputs.items():
-            if 'features' in name and 'features' in encoder_out:
-                features_input = encoder_out['features']
-                tensor.copy_(torch.from_numpy(features_input))
-                print(f"  Input {name}: shape={features_input.shape}, min={features_input.min():.4f}, max={features_input.max():.4f}, mean={features_input.mean():.4f}")
-            elif 'cls_token' in name and 'cls_token' in encoder_out:
-                cls_input = encoder_out['cls_token']
-                tensor.copy_(torch.from_numpy(cls_input))
-                print(f"  Input {name}: shape={cls_input.shape}, min={cls_input.min():.4f}, max={cls_input.max():.4f}, mean={cls_input.mean():.4f}")
-        
-        # Get bindings pointer list
-        bindings_ptr = [t.data_ptr() for t in self.decoder_bindings]
-        t5 = time.time()
-        
-        # Execute
-        self.decoder_context.execute_v2(bindings_ptr)
-        t6 = time.time()
-        print(f"Decoder: prepare {(t5-t4)*1000:.1f}ms, execute {(t6-t5)*1000:.1f}ms")
         
         # Get outputs
         results = {}
-        t7 = time.time()
-        for name, tensor in self.decoder_outputs.items():
+        t3 = time.time()
+        for name, tensor in self.outputs.items():
             arr = tensor.cpu().numpy()
             # 如果是 FP16，转换为 FP32
             if arr.dtype == np.float16:
                 arr = arr.astype(np.float32)
             results[name] = arr
             print(f"  Output {name}: shape={arr.shape}, min={arr.min():.4f}, max={arr.max():.4f}, mean={arr.mean():.4f}, dtype={arr.dtype}")
+        
+        print(f"Inference time: prepare {(t1-t0)*1000:.1f}ms, execute {(t2-t1)*1000:.1f}ms, total {(t3-t0)*1000:.1f}ms")
         
         return results
 
@@ -205,18 +149,28 @@ class PyTorchModel:
     
     def infer(self, image: torch.Tensor, depth: torch.Tensor) -> Dict:
         """Run inference."""
+        t0 = time.time()
         image, depth = image.to(self.device), depth.to(self.device)
+        t1 = time.time()
+        print(f"Input data cpu to gpu time: {(t1 - t0)*1000:.4f} ms")
         if image.dtype == torch.float16:
             image, depth = image.half(), depth.half()
         with torch.inference_mode():
+            t2 = time.time()
             out = self.model.infer(image, depth_in=depth)
-        return {k: v.cpu().numpy() for k, v in out.items()}
+            t3 = time.time()
+            print(f"Model inference time: {(t3 - t2)*1000:.4f} ms")
+        # Use pinned memory for faster GPU->CPU transfer
+        t4 = time.time()
+        result = {k: v.cpu().numpy() for k, v in out.items()}
+        t5 = time.time()
+        print(f"Output data gpu to cpu time: {(t5 - t4)*1000:.4f} ms")
+        return result
 
 
 def main():
     parser = argparse.ArgumentParser(description='TensorRT Inference')
-    parser.add_argument('--encoder', type=str, required=True, help='Encoder engine path')
-    parser.add_argument('--decoder', type=str, required=True, help='Decoder engine path')
+    parser.add_argument('--engine', type=str, required=True, help='Full engine path (encoder+decoder merged)')
     parser.add_argument('--input', type=str, default='examples/0', help='Input directory')
     parser.add_argument('--output', type=str, default='result_trt', help='Output directory')
     parser.add_argument('--num-runs', type=int, default=10, help='Number of runs')
@@ -233,7 +187,7 @@ def main():
     
     # Run inference
     if TENSORRT_AVAILABLE:
-        engine = SplitTensorRTEngine(args.encoder, args.decoder).load()
+        engine = TensorRTEngine(args.engine).load()
         times = []
         for i in range(args.num_runs):
             start = time.time()
@@ -244,11 +198,20 @@ def main():
         print(f"\nTensorRT: {avg_time*1000:.1f}ms avg, FPS: {1/avg_time:.1f}")
     else:
         print("Using PyTorch fallback.")
+        times = []
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         image_tensor = torch.tensor(image_np, dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
         pytorch = PyTorchModel('/home/zxw/models/lingbot-depth-pretrain-vitl-14/model.pt')
         results = pytorch.infer(image_tensor, torch.tensor(depth_np).unsqueeze(0).cuda())
-        depth_pred = results['depth']
+        for i in range(args.num_runs):
+            start = time.time()
+            results = pytorch.infer(image_tensor, torch.tensor(depth_np).unsqueeze(0).cuda())
+            end = time.time()
+            print(f"Run {i+1}/{args.num_runs}: {(end - start)*1000:.1f}ms")
+            depth_pred = results['depth']
+            times.append(time.time() - start)
+        avg_time = sum(times) / len(times)
+        print(f"\nPyTorch: {avg_time*1000:.1f}ms avg, FPS: {1/avg_time:.1f}")
     
     # Save results
     # Decoder 输出已经是 (B, H, W) 格式

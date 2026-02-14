@@ -1,4 +1,3 @@
 python tensorrt_infer.py \
-    --encoder result/acc_models/encoder.engine \
-    --decoder result/acc_models/decoder.engine \
+    --engine result/acc_models/full.engine \
     --input examples/my/

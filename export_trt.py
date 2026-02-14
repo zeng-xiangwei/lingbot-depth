@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TensorRT Engine Build Script for LingBot-Depth Model
-分阶段导出：Encoder -> Neck/Heads
+合并导出：Encoder + Decoder -> Single ONNX
 """
 import os
 os.environ['XFORMERS_DISABLED'] = '1'
@@ -23,86 +23,21 @@ except ImportError:
 from mdm.model.v2 import MDMModel
 
 
-def build_encoder_engine(model, dummy_input, engine_path, precision='fp16'):
+def build_full_model(model, dummy_input, engine_path, precision='fp16'):
     """
-    Build TensorRT engine for encoder using ONNX as intermediate.
-    Encoder forward: image + depth -> features + cls_token
-    """
-    onnx_path = engine_path.replace('.engine', '.onnx')
-    print(f"Exporting encoder to ONNX: {onnx_path}")
-    
-    encoder = model.encoder
-    encoder.eval()
-    encoder.onnx_compatible_mode = True
-    
-    device = next(encoder.parameters()).device
-    dummy_image = torch.randn(1, 3, 480, 640, dtype=torch.float32, device=device)
-    dummy_depth = torch.randn(1, 1, 480, 640, dtype=torch.float32, device=device)
-
-    width = 640
-    height = 480
-    aspect_ratio = width / height
-    min_tokens, max_tokens = model.num_tokens_range
-    resolution_level = 9
-    num_tokens = int(min_tokens + (resolution_level / 9) * (max_tokens - min_tokens))
-    base_h = int(round((num_tokens / aspect_ratio) ** 0.5))
-    base_w = int(round((num_tokens * aspect_ratio) ** 0.5))
-    
-    # Get num_tokens_range from model config
-    num_tokens_range = model.num_tokens_range
-    print(f"Exporting encoder with num_tokens_range={num_tokens_range}")
-    
-    # EncoderWrapper with num_tokens_range as member variable
-    class EncoderWrapper(nn.Module):
-        def __init__(self, encoder, base_h, base_w):
-            super().__init__()
-            self.encoder = encoder
-            self.base_h = base_h
-            self.base_w = base_w
-        def forward(self, image, depth):            
-            # Forward
-            features, cls_token, _, _ = self.encoder(
-                image, depth, self.base_h, self.base_w, 
-                return_class_token=True, remap_depth_in='log'
-            )
-            return features, cls_token
-    
-    wrapper = EncoderWrapper(encoder, base_h, base_w)
-    wrapper.eval()
-    
-    # Export with dynamic axes to preserve output shapes
-    torch.onnx.export(
-        wrapper,
-        (dummy_image, dummy_depth),
-        onnx_path,
-        input_names=['image', 'depth'],
-        output_names=['features', 'cls_token'],
-        opset_version=16,
-        do_constant_folding=True,
-        dynamic_axes=None,
-    )
-    
-    print(f"Encoder ONNX exported: {onnx_path}")
-    
-    # if TRT_AVAILABLE:
-    #     return build_engine_from_onnx(onnx_path, engine_path, precision)
-    return onnx_path
-
-
-def build_decoder_engine(model, dummy_input, engine_path, precision='fp16'):
-    """
-    Build TensorRT engine for decoder (neck + heads).
-    Decoder forward: features + cls_token -> depth_reg + mask
+    Build complete model (Encoder + Decoder) as single ONNX.
+    Forward: image + depth -> depth_reg + mask
     """
     onnx_path = engine_path.replace('.engine', '.onnx')
-    print(f"Exporting decoder to ONNX: {onnx_path}")
+    print(f"Exporting full model to ONNX: {onnx_path}")
     
     base_h, base_w = dummy_input['base_h'], dummy_input['base_w']
     aspect_ratio = base_w / base_h
+    output_size = (480, 640)  # 原始图像尺寸
     
-    # Dynamically create UV coordinates on the fly (avoid CPU/GPU mismatch)
-    class FullDecoderWrapper(nn.Module):
-        """Complete decoder that dynamically creates UV coordinates."""
+    # Complete model wrapper
+    class FullModelWrapper(nn.Module):
+        """Complete model: Encoder + Decoder in one"""
         
         def __init__(self, model, base_h, base_w, aspect_ratio, output_size):
             super().__init__()
@@ -110,11 +45,18 @@ def build_decoder_engine(model, dummy_input, engine_path, precision='fp16'):
             self.base_h = base_h
             self.base_w = base_w
             self.aspect_ratio = aspect_ratio
-            self.output_size = output_size  # (480, 640)
+            self.output_size = output_size
             
-        def forward(self, features, cls_token):
+        def forward(self, image, depth):
             from mdm.utils.geo import normalized_view_plane_uv
             
+            # ===== Encoder =====
+            features, cls_token, _, _ = self.model.encoder(
+                image, depth, self.base_h, self.base_w, 
+                return_class_token=True, remap_depth_in='log'
+            )
+            
+            # ===== Decoder =====
             batch_size = features.shape[0]
             device = features.device
             dtype = features.dtype
@@ -123,7 +65,7 @@ def build_decoder_engine(model, dummy_input, engine_path, precision='fp16'):
             features = features + cls_token[..., None, None]
             features = [features, None, None, None, None]
             
-            # Dynamically create UV coordinates on the same device
+            # Dynamically create UV coordinates
             for level in range(5):
                 uv = normalized_view_plane_uv(
                     width=self.base_w * 2 ** level,
@@ -148,19 +90,20 @@ def build_decoder_engine(model, dummy_input, engine_path, precision='fp16'):
                 depth_reg, 
                 size=self.output_size, 
                 mode='bilinear', 
-                align_corners=False
+                align_corners=False,
             )
-            # Use reshape instead of squeeze to avoid If nodes
+            # Use reshape instead of squeeze
             B, C, H, W = depth_reg.shape
             depth_reg = depth_reg.reshape(B, H, W)
             # Apply remap_depth_out (exp)
             depth_reg = depth_reg.exp()
+            
             mask = self.model.mask_head(features)[-1]
             mask = F.interpolate(
                 mask, 
                 size=self.output_size, 
                 mode='bilinear', 
-                align_corners=False
+                align_corners=False,
             )
             # Use reshape instead of squeeze
             B, C, H, W = mask.shape
@@ -168,31 +111,30 @@ def build_decoder_engine(model, dummy_input, engine_path, precision='fp16'):
             
             return depth_reg, mask
     
-    decoder = FullDecoderWrapper(model, base_h, base_w, aspect_ratio, output_size=(480, 640))
-    decoder.eval()
+    # Create wrapper
+    wrapper = FullModelWrapper(model, base_h, base_w, aspect_ratio, output_size)
+    wrapper.eval()
     
-    # Dummy inputs matching encoder output shapes
-    B, C, H, W = dummy_input['features_shape']
-    dummy_features = torch.randn(B, C, H, W, dtype=torch.float32, device='cuda')
-    dummy_cls = torch.randn(B, C, dtype=torch.float32, device='cuda')
+    # Dummy inputs
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    dummy_image = torch.randn(1, 3, 480, 640, dtype=torch.float32, device=device)
+    dummy_depth = torch.randn(1, 1, 480, 640, dtype=torch.float32, device=device)
     
-    print(f"Exporting decoder with features_shape={dummy_input['features_shape']}")
+    print(f"Exporting full model with input shape: image={dummy_image.shape}, depth={dummy_depth.shape}")
     
+    # Export with dynamic axes
     torch.onnx.export(
-        decoder,
-        (dummy_features, dummy_cls),
+        wrapper,
+        (dummy_image, dummy_depth),
         onnx_path,
-        input_names=['features', 'cls_token'],
+        input_names=['image', 'depth'],
         output_names=['depth_reg', 'mask'],
         opset_version=16,
         do_constant_folding=True,
         dynamic_axes=None,
     )
     
-    print(f"Decoder ONNX exported: {onnx_path}")
-    
-    # if TRT_AVAILABLE:
-    #     return build_engine_from_onnx(onnx_path, engine_path, precision)
+    print(f"Full model ONNX exported: {onnx_path}")
     return onnx_path
 
 
@@ -252,6 +194,7 @@ def export_static(model_path: str, output_path: str, height: int = 480, width: i
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     model = MDMModel.from_pretrained(model_path)
+    model.encoder.onnx_compatible_mode = True
     model.to(device)
     model.eval()
     
@@ -266,39 +209,23 @@ def export_static(model_path: str, output_path: str, height: int = 480, width: i
     print(f"Input: {height}x{width}")
     print(f"Tokens: {num_tokens}, base_h={base_h}, base_w={base_w}")
     
-    # Feature dimension from encoder
-    feat_dim = model.encoder.dim_features
-    print(f"Encoder feature dimension: {feat_dim}")
-    
-    # Dummy inputs for shape inference
+    # Dummy inputs
     dummy_input = {
         'base_h': base_h,
         'base_w': base_w,
-        'features_shape': (1, feat_dim, base_h, base_w),
     }
     
     output_dir = Path(output_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {output_dir}")
     
-    # Build encoder
-    encoder_engine_path = str(output_dir / 'encoder.engine')
+    # Build full model (merged encoder + decoder)
+    full_engine_path = str(output_dir / 'full.engine')
     try:
-        encoder_onnx = build_encoder_engine(model, dummy_input, encoder_engine_path, 'fp16')
-        print(f"Encoder: {encoder_onnx}")
+        full_onnx = build_full_model(model, dummy_input, full_engine_path, 'fp16')
+        print(f"Full model: {full_onnx}")
     except Exception as e:
-        print(f"Encoder build failed: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
-    
-    # Build decoder
-    decoder_engine_path = str(output_dir / 'decoder.engine')
-    try:
-        decoder_onnx = build_decoder_engine(model, dummy_input, decoder_engine_path, 'fp16')
-        print(f"Decoder: {decoder_onnx}")
-    except Exception as e:
-        print(f"Decoder build failed: {e}")
+        print(f"Full model build failed: {e}")
         import traceback
         traceback.print_exc()
         raise
@@ -308,10 +235,8 @@ def export_static(model_path: str, output_path: str, height: int = 480, width: i
     print("=" * 60)
     
     return {
-        'encoder_onnx': encoder_onnx,
-        'decoder_onnx': decoder_onnx,
-        'encoder_engine': encoder_engine_path if TRT_AVAILABLE else None,
-        'decoder_engine': decoder_engine_path if TRT_AVAILABLE else None,
+        'full_onnx': full_onnx,
+        'full_engine': full_engine_path if TRT_AVAILABLE else None,
     }
 
 

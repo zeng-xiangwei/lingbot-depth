@@ -300,6 +300,13 @@ Examples:
         print(f"\n🔄 Running inference...")
         # Perform 10 inferences and measure timing
         inference_times = []
+        output = model.infer(
+            image_tensor,
+            depth_in=depth_tensor,
+            apply_mask=not args.no_mask,
+            use_fp16=True,
+            intrinsics=intrinsics_tensor
+        )
         for i in range(10):
             start_time = time.time()
             with torch.no_grad():
@@ -310,6 +317,9 @@ Examples:
                     use_fp16=True,
                     intrinsics=intrinsics_tensor
                 )
+
+                # depth_pred = output['depth'].squeeze().cpu().numpy()
+                # points_pred = output['points'].squeeze().cpu().numpy()
             inference_time = time.time() - start_time
             inference_times.append(inference_time)
             print(f"   Inference {i+1}: {inference_time:.3f}s")

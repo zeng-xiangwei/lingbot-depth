@@ -1,1 +1,1 @@
-python check_onnx.py result/acc_models/encoder.onnx
+python check_onnx.py result/acc_models/full.onnx

@@ -1,4 +1,3 @@
 python onnx_infer.py \
-    --encoder result/acc_models/encoder.onnx \
-    --decoder result/acc_models/decoder.onnx \
+    --model result/acc_models/full.onnx \
     --input examples/my/
