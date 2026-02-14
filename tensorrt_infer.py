@@ -30,6 +30,8 @@ def preprocess_image(image_path):
     """Load and preprocess RGB image."""
     image_np = cv2.imread(image_path)
     image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+    # Normalize to [0, 1]
+    image_np = image_np.astype(np.float32) / 255.0
     return image_np
 
 
@@ -118,23 +120,22 @@ class SplitTensorRTEngine:
     
     def infer(self, image_np: np.ndarray, depth_np: np.ndarray) -> Dict:
         """Run two-stage inference using pre-allocated buffers."""
-        # Convert HWC to CHW
-        image_chw = np.transpose(image_np, (2, 0, 1)).astype(np.float32)
+        # Convert HWC to CHW and normalize to [0, 1]
+        image_chw = np.transpose(image_np, (2, 0, 1))[np.newaxis, :, :, :]
         
         # ===== Stage 1: Encoder =====
         print("Running Encoder...")
         t0 = time.time()
         
-        # Copy data to pre-allocated buffers
+        # Copy data to pre-allocated buffers (only image and depth inputs)
         for name, tensor in self.encoder_inputs.items():
             if 'image' in name:
                 tensor.copy_(torch.from_numpy(image_chw))
+                print(f"  Input {name}: shape={image_chw.shape}, min={image_chw.min():.4f}, max={image_chw.max():.4f}, mean={image_chw.mean():.4f}")
             elif 'depth' in name:
-                tensor.copy_(torch.from_numpy(depth_np[np.newaxis]))
-            elif 'base_h' in name:
-                tensor.fill_(52)
-            elif 'base_w' in name:
-                tensor.fill_(69)
+                depth_input = depth_np[np.newaxis, np.newaxis, :, :]
+                tensor.copy_(torch.from_numpy(depth_input))
+                print(f"  Input {name}: shape={depth_input.shape}, min={depth_input.min():.4f}, max={depth_input.max():.4f}, mean={depth_input.mean():.4f}")
         
         # Get bindings pointer list
         bindings_ptr = [t.data_ptr() for t in self.encoder_bindings]
@@ -149,8 +150,9 @@ class SplitTensorRTEngine:
         encoder_out = {}
         t3 = time.time()
         for name, tensor in self.encoder_outputs.items():
-            encoder_out[name] = tensor.cpu().numpy()
-            print(f"  Output {name}: shape={encoder_out[name].shape}")
+            arr = tensor.cpu().numpy()
+            encoder_out[name] = arr
+            print(f"  Output {name}: shape={arr.shape}, min={arr.min():.4f}, max={arr.max():.4f}, mean={arr.mean():.4f}, dtype={arr.dtype}")
         
         # ===== Stage 2: Decoder =====
         print("Running Decoder...")
@@ -159,9 +161,13 @@ class SplitTensorRTEngine:
         # Copy encoder outputs to decoder inputs
         for name, tensor in self.decoder_inputs.items():
             if 'features' in name and 'features' in encoder_out:
-                tensor.copy_(torch.from_numpy(encoder_out['features']))
+                features_input = encoder_out['features']
+                tensor.copy_(torch.from_numpy(features_input))
+                print(f"  Input {name}: shape={features_input.shape}, min={features_input.min():.4f}, max={features_input.max():.4f}, mean={features_input.mean():.4f}")
             elif 'cls_token' in name and 'cls_token' in encoder_out:
-                tensor.copy_(torch.from_numpy(encoder_out['cls_token']))
+                cls_input = encoder_out['cls_token']
+                tensor.copy_(torch.from_numpy(cls_input))
+                print(f"  Input {name}: shape={cls_input.shape}, min={cls_input.min():.4f}, max={cls_input.max():.4f}, mean={cls_input.mean():.4f}")
         
         # Get bindings pointer list
         bindings_ptr = [t.data_ptr() for t in self.decoder_bindings]
@@ -181,7 +187,7 @@ class SplitTensorRTEngine:
             if arr.dtype == np.float16:
                 arr = arr.astype(np.float32)
             results[name] = arr
-            print(f"  Output {name}: shape={arr.shape}, dtype={arr.dtype}")
+            print(f"  Output {name}: shape={arr.shape}, min={arr.min():.4f}, max={arr.max():.4f}, mean={arr.mean():.4f}, dtype={arr.dtype}")
         
         return results
 
@@ -239,7 +245,7 @@ def main():
     else:
         print("Using PyTorch fallback.")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        image_tensor = torch.tensor(image_np / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
+        image_tensor = torch.tensor(image_np, dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
         pytorch = PyTorchModel('/home/zxw/models/lingbot-depth-pretrain-vitl-14/model.pt')
         results = pytorch.infer(image_tensor, torch.tensor(depth_np).unsqueeze(0).cuda())
         depth_pred = results['depth']
@@ -254,7 +260,7 @@ def main():
         depth_pred = depth_pred.squeeze()
     np.save(output_dir / 'depth_refined.npy', depth_pred)
     cv2.imwrite(str(output_dir / 'depth_refined.png'), depth_to_color(depth_pred))
-    cv2.imwrite(str(output_dir / 'rgb.png'), cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(output_dir / 'rgb.png'), cv2.cvtColor((image_np * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
     print(f"\nResults saved to {output_dir}")
 
 

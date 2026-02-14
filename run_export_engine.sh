@@ -3,9 +3,10 @@ python export_trt.py --model "/home/zxw/models/lingbot-depth-pretrain-vitl-14/mo
     --precision fp16 \
 
 # Encoder
-# bash ./build_engine.sh \
-#     --onnx result/acc_models/encoder.onnx \
-#     --engine result/acc_models/encoder.engine \
+bash ./build_engine.sh \
+    --onnx result/acc_models/encoder.onnx \
+    --engine result/acc_models/encoder.engine \
+    --precision fp16 \
 
 # # Decoder
 # bash ./build_engine.sh \

@@ -38,29 +38,44 @@ def build_encoder_engine(model, dummy_input, engine_path, precision='fp16'):
     device = next(encoder.parameters()).device
     dummy_image = torch.randn(1, 3, 480, 640, dtype=torch.float32, device=device)
     dummy_depth = torch.randn(1, 1, 480, 640, dtype=torch.float32, device=device)
+
+    width = 640
+    height = 480
+    aspect_ratio = width / height
+    min_tokens, max_tokens = model.num_tokens_range
+    resolution_level = 9
+    num_tokens = int(min_tokens + (resolution_level / 9) * (max_tokens - min_tokens))
+    base_h = int(round((num_tokens / aspect_ratio) ** 0.5))
+    base_w = int(round((num_tokens * aspect_ratio) ** 0.5))
     
-    base_h, base_w = dummy_input['base_h'], dummy_input['base_w']
-    print(f"Exporting with base_h={base_h}, base_w={base_w}")
+    # Get num_tokens_range from model config
+    num_tokens_range = model.num_tokens_range
+    print(f"Exporting encoder with num_tokens_range={num_tokens_range}")
     
-    # Export encoder - use a wrapper to ensure correct output names
+    # EncoderWrapper with num_tokens_range as member variable
     class EncoderWrapper(nn.Module):
-        def __init__(self, encoder):
+        def __init__(self, encoder, base_h, base_w):
             super().__init__()
             self.encoder = encoder
-            
-        def forward(self, image, depth, base_h, base_w):
-            # Forward and only return features and cls_token
-            features, cls_token, _, _ = self.encoder(image, depth, base_h, base_w, return_class_token=True, remap_depth_in='log')
+            self.base_h = base_h
+            self.base_w = base_w
+        def forward(self, image, depth):            
+            # Forward
+            features, cls_token, _, _ = self.encoder(
+                image, depth, self.base_h, self.base_w, 
+                return_class_token=True, remap_depth_in='log'
+            )
             return features, cls_token
     
-    wrapper = EncoderWrapper(encoder)
+    wrapper = EncoderWrapper(encoder, base_h, base_w)
     wrapper.eval()
     
+    # Export with dynamic axes to preserve output shapes
     torch.onnx.export(
         wrapper,
-        (dummy_image, dummy_depth, base_h, base_w),
+        (dummy_image, dummy_depth),
         onnx_path,
-        input_names=['image', 'depth', 'base_h', 'base_w'],
+        input_names=['image', 'depth'],
         output_names=['features', 'cls_token'],
         opset_version=16,
         do_constant_folding=True,
@@ -275,7 +290,7 @@ def export_static(model_path: str, output_path: str, height: int = 480, width: i
         print(f"Encoder build failed: {e}")
         import traceback
         traceback.print_exc()
-        encoder_onnx = str(output_dir / 'encoder.onnx')
+        raise
     
     # Build decoder
     decoder_engine_path = str(output_dir / 'decoder.engine')
@@ -286,7 +301,7 @@ def export_static(model_path: str, output_path: str, height: int = 480, width: i
         print(f"Decoder build failed: {e}")
         import traceback
         traceback.print_exc()
-        decoder_onnx = str(output_dir / 'decoder.onnx')
+        raise
     
     print("\n" + "=" * 60)
     print("Export complete!")
