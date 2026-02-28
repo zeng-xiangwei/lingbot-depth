@@ -135,6 +135,7 @@ CMD="trtexec \
     --onnx=$ONNX_FILE \
     --saveEngine=$ENGINE_FILE \
     $PRECISION_FLAG \
+    --verbose \
     "
 
 echo "Running: $CMD"
