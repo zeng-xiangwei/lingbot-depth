@@ -1,3 +1,8 @@
+# tensorrt 加速尝试
+1. 导出 tensorrt 加速的 engine 模型 `bash run_export_engine.sh`，该脚本中先导出 onnx 模型，再将 onnx 模型导出为 engine 模型
+2. 运行 onnx 模型 `bash run_onnx_infer.sh`，用来检查 onnx 导出结果是否正确 
+3. 运行 engine 模型 `bash run_tensorrt_infer.sh`，测试加速效果
+
 # LingBot-Depth: Masked Depth Modeling for Spatial Perception
 
 
