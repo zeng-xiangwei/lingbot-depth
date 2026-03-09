@@ -12,6 +12,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
 
+import cv2
+import numpy as np
+
 # TensorRT imports
 try:
     import tensorrt as trt
@@ -21,6 +24,187 @@ except ImportError:
     print("TensorRT not available, will generate ONNX only")
 
 from mdm.model.v2 import MDMModel
+
+
+def preprocess_image(image_path: str) -> np.ndarray:
+    """Load and preprocess RGB image."""
+    image_np = cv2.imread(image_path)
+    if image_np is None:
+        raise ValueError(f"Failed to read image: {image_path}")
+    image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+    # Normalize to [0, 1]
+    image_np = image_np.astype(np.float32) / 255.0
+    return image_np
+
+
+def load_depth(depth_path: str, scale: float = 1000.0) -> np.ndarray:
+    """Load depth map from PNG (16-bit)."""
+    depth_map = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+    if depth_map is None:
+        raise ValueError(f"Failed to read depth: {depth_path}")
+    depth_map = depth_map.astype(np.float32) / scale
+    depth_map = np.nan_to_num(depth_map, nan=0.0, posinf=0.0, neginf=0.0)
+    return depth_map
+
+
+def build_preprocess_model(model, dummy_input, onnx_path):
+    """
+    Step 1: Export preprocessing module (image normalization + depth processing)
+    Input: image (1,3,H,W), depth (1,1,H,W)
+    Output: image_14 (normalized), depth_14 (processed)
+    """
+    print(f"Exporting preprocessing model to ONNX: {onnx_path}")
+    
+    base_h, base_w = dummy_input['base_h'], dummy_input['base_w']
+    
+    # Preprocessing wrapper - separates image normalization and depth processing
+    class PreprocessWrapper(nn.Module):
+        """Preprocessing only wrapper"""
+        
+        def __init__(self, encoder, base_h, base_w):
+            super().__init__()
+            self.encoder = encoder
+            self.base_h = base_h
+            self.base_w = base_w
+            # ImageNet normalization
+            self.register_buffer("image_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+            self.register_buffer("image_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+            
+        def forward(self, image, depth):
+            # 直接使用 base_h 和 base_w 作为 token 数量
+            token_rows = self.base_h
+            token_cols = self.base_w
+            max_tokens = 7180  # 固定的最大 token 数量
+            
+            # Image preprocessing
+            image_14 = F.interpolate(image, (token_rows * 14, token_cols * 14), mode="bilinear", align_corners=False)
+            image_14 = (image_14 - self.image_mean) / self.image_std
+            
+            # Depth preprocessing
+            depth_14 = F.interpolate(depth, (token_rows * 14, token_cols * 14), mode="nearest")
+            
+            # Handle invalid depth values
+            depth_14[torch.isinf(depth_14)] = 0.0
+            depth_14[torch.isnan(depth_14)] = 0.0
+            dmask_14 = (depth_14 > 0.01).detach()
+            depth_14 = depth_14 * dmask_14.float()
+            
+            # Apply log transform
+            depth_14 = torch.log(depth_14)
+            depth_14[~dmask_14] = 0.0
+            depth_14 = torch.nan_to_num(depth_14, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            features = self.encoder.backbone.get_intermediate_layers_mae(
+                x_img=image_14, 
+                x_depth=depth_14, 
+                n=self.encoder.intermediate_layers, 
+                return_class_token=True)
+
+            x = features[0][0]  # shape: (1, dynamic_tokens, 1024)
+            cls_token = features[0][0]
+            
+            # 将动态 token 数量 padding 到固定的 max_tokens
+            # x shape: (1, dynamic_tokens, 1024) -> (1, max_tokens, 1024)
+            current_tokens = x.shape[1]
+            if current_tokens < max_tokens:
+                # Padding
+                padding = torch.zeros(1, max_tokens - current_tokens, x.shape[2], 
+                                     dtype=x.dtype, device=x.device)
+                x = torch.cat([x, padding], dim=1)
+                cls_token = torch.cat([cls_token, padding], dim=1)
+            elif current_tokens > max_tokens:
+                # 截断
+                x = x[:, :max_tokens, :]
+                cls_token = cls_token[:, :max_tokens, :]
+            
+            print(f"x shape: {x.shape}, cls_token shape: {cls_token.shape}")
+            return x, cls_token
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    wrapper = PreprocessWrapper(model.encoder, base_h, base_w)
+    wrapper.to(device)
+    wrapper.eval()
+    
+    # Dummy inputs
+    dummy_image = torch.randn(1, 3, 480, 640, dtype=torch.float32, device=device)
+    dummy_depth = torch.randn(1, 1, 480, 640, dtype=torch.float32, device=device)
+    
+    print(f"Exporting preprocessing with input shape: image={dummy_image.shape}, depth={dummy_depth.shape}")
+    print(f"Token dimensions: base_h={base_h}, base_w={base_w}")
+    
+    # Export to ONNX with dynamic axes
+    # Dynamic axes: batch dimension (0) and sequence dimension (1) are dynamic
+    torch.onnx.export(
+        wrapper,
+        (dummy_image, dummy_depth),
+        onnx_path,
+        input_names=['image', 'depth'],
+        output_names=['x', 'cls_token'],
+        opset_version=17,
+        dynamic_axes=None,
+        do_constant_folding=False,
+    )
+    
+    print(f"Preprocessing ONNX exported: {onnx_path}")
+    return onnx_path
+
+
+def build_encoder_model(model, dummy_input, engine_path, precision='fp16'):
+    """
+    Build encoder-only model to ONNX.
+    Forward: image + depth -> features + cls_token
+    """
+    onnx_path = engine_path.replace('.engine', '.onnx')
+    print(f"Exporting encoder model to ONNX: {onnx_path}")
+    
+    base_h, base_w = dummy_input['base_h'], dummy_input['base_w']
+    
+    # Encoder wrapper
+    class EncoderWrapper(nn.Module):
+        """Encoder only wrapper"""
+        
+        def __init__(self, encoder, base_h, base_w):
+            super().__init__()
+            self.encoder = encoder
+            self.base_h = base_h
+            self.base_w = base_w
+            
+        def forward(self, image, depth):
+            # Forward through encoder
+            features, cls_token, _, _ = self.encoder(
+                image, depth, 
+                self.base_h, self.base_w, 
+                return_class_token=True, 
+                remap_depth_in='log'
+            )
+            return features, cls_token
+    
+    # Create wrapper
+    wrapper = EncoderWrapper(model.encoder, base_h, base_w)
+    wrapper.eval()
+    
+    # Dummy inputs
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    dummy_image = torch.randn(1, 3, 480, 640, dtype=torch.float32, device=device)
+    dummy_depth = torch.randn(1, 1, 480, 640, dtype=torch.float32, device=device)
+    
+    print(f"Exporting encoder with input shape: image={dummy_image.shape}, depth={dummy_depth.shape}")
+    print(f"Token dimensions: base_h={base_h}, base_w={base_w}")
+    
+    # Export to ONNX
+    torch.onnx.export(
+        wrapper,
+        (dummy_image, dummy_depth),
+        onnx_path,
+        input_names=['image', 'depth'],
+        output_names=['features', 'cls_token'],
+        opset_version=17,
+        dynamic_axes=None,
+        do_constant_folding=True,
+    )
+    
+    print(f"Encoder ONNX exported: {onnx_path}")
+    return onnx_path
 
 
 def build_full_model(model, dummy_input, engine_path, precision='fp16'):
@@ -57,9 +241,8 @@ def build_full_model(model, dummy_input, engine_path, precision='fp16'):
             )
             
             # ===== Decoder =====
-            batch_size = features.shape[0]
-            device = features.device
-            dtype = features.dtype
+            batch_size, _, img_h, img_w = image.shape
+            device, dtype = image.device, image.dtype
             
             # Add cls token to features
             features = features + cls_token[..., None, None]
@@ -94,9 +277,7 @@ def build_full_model(model, dummy_input, engine_path, precision='fp16'):
             )
             # Use reshape instead of squeeze
             B, C, H, W = depth_reg.shape
-            depth_reg = depth_reg.reshape(B, H, W)
-            # Apply remap_depth_out (exp)
-            depth_reg = depth_reg.exp()
+            depth_reg = depth_reg.exp().reshape(B, H, W)
             
             mask = self.model.mask_head(features)[-1]
             mask = F.interpolate(
@@ -129,9 +310,9 @@ def build_full_model(model, dummy_input, engine_path, precision='fp16'):
         onnx_path,
         input_names=['image', 'depth'],
         output_names=['depth_reg', 'mask'],
-        opset_version=16,
-        do_constant_folding=True,
+        opset_version=17,
         dynamic_axes=None,
+        do_constant_folding=True,
     )
     
     print(f"Full model ONNX exported: {onnx_path}")
@@ -188,7 +369,7 @@ def build_engine_from_onnx(onnx_path, engine_path, precision='fp16'):
     return engine_path
 
 
-def export_static(model_path: str, output_path: str, height: int = 480, width: int = 640):
+def export_static(model_path: str, output_path: str, height: int = 480, width: int = 640, export_encoder: bool = True):
     """Export model for TensorRT with static shapes."""
     print(f"Loading model from: {model_path}")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -219,6 +400,22 @@ def export_static(model_path: str, output_path: str, height: int = 480, width: i
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {output_dir}")
     
+    result = {}
+    
+    # Build encoder-only model
+    if export_encoder:
+        encoder_engine_path = str(output_dir / 'encoder.engine')
+        try:
+            # encoder_onnx = build_encoder_model(model, dummy_input, encoder_engine_path, 'fp16')
+            encoder_onnx = build_preprocess_model(model, dummy_input, str(output_dir / 'preprocess.onnx'))
+            print(f"Encoder model: {encoder_onnx}")
+            result['encoder_onnx'] = encoder_onnx
+        except Exception as e:
+            print(f"Encoder model export failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Continue even if encoder fails
+    
     # Build full model (merged encoder + decoder)
     full_engine_path = str(output_dir / 'full.engine')
     try:
@@ -234,10 +431,10 @@ def export_static(model_path: str, output_path: str, height: int = 480, width: i
     print("Export complete!")
     print("=" * 60)
     
-    return {
-        'full_onnx': full_onnx,
-        'full_engine': full_engine_path if TRT_AVAILABLE else None,
-    }
+    # result['full_onnx'] = full_onnx
+    # result['full_engine'] = full_engine_path if TRT_AVAILABLE else None
+    
+    return result
 
 
 def main():
@@ -248,12 +445,13 @@ def main():
     parser.add_argument('--width', type=int, default=640, help='Input width')
     parser.add_argument('--precision', type=str, default='fp16', 
                        choices=['fp16', 'fp32', 'int8'], help='Precision')
+    parser.add_argument('--encoder-only', action='store_true', help='Only export encoder to ONNX/TensorRT for debugging')
     
     args = parser.parse_args()
     print(f"Arguments: {args}")
     
     print("=" * 60)
-    export_static(args.model, args.output, args.height, args.width)
+    export_static(args.model, args.output, args.height, args.width, export_encoder=True)    
     print("=" * 60)
 
 

@@ -136,6 +136,86 @@ class TensorRTEngine:
         return results
 
 
+class TensorRTEncoderEngine:
+    """TensorRT engine for encoder-only model."""
+    
+    def __init__(self, engine_path: str):
+        self.engine_path = Path(engine_path)
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        self.runtime = trt.Runtime(self.logger)
+        
+    def load(self):
+        """Load engine and pre-allocate buffers."""
+        print(f"Loading encoder engine: {self.engine_path}")
+        with open(self.engine_path, 'rb') as f:
+            self.engine = self.runtime.deserialize_cuda_engine(f.read())
+        
+        self.context = self.engine.create_execution_context()
+        self.bindings = []
+        self.inputs = {}
+        self.outputs = {}
+        
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            shape = tuple(self.engine.get_tensor_shape(name))
+            mode = self.engine.get_tensor_mode(name)
+            print(f"  {name}: shape={shape}, mode={mode}")
+            
+            tensor = torch.empty(shape, dtype=torch.float32, device='cuda')
+            self.bindings.append(tensor)
+            
+            if mode == trt.TensorIOMode.INPUT:
+                self.inputs[name] = tensor
+            else:
+                self.outputs[name] = tensor
+        
+        print("Encoder engine loaded and buffers pre-allocated.")
+        return self
+    
+    def infer(self, image_np: np.ndarray, depth_np: np.ndarray) -> Dict:
+        """Run encoder inference using pre-allocated buffers."""
+        # Convert HWC to CHW
+        image_chw = np.transpose(image_np, (2, 0, 1))[np.newaxis, :, :, :]
+        depth_chw = depth_np[np.newaxis, np.newaxis, :, :]
+        
+        print("Running encoder inference...")
+        t0 = time.time()
+        
+        # Copy data to pre-allocated buffers
+        for name, tensor in self.inputs.items():
+            if 'image' in name:
+                input_tensor = torch.from_numpy(image_chw)
+                tensor.copy_(input_tensor)
+                print(f"  Input {name}: shape={image_chw.shape}, min={image_chw.min():.4f}, max={image_chw.max():.4f}, mean={image_chw.mean():.4f}, dtype={image_chw.dtype}")
+            elif 'depth' in name:
+                input_tensor = torch.from_numpy(depth_chw)
+                tensor.copy_(input_tensor)
+                print(f"  Input {name}: shape={depth_chw.shape}, min={depth_chw.min():.4f}, max={depth_chw.max():.4f}, mean={depth_chw.mean():.4f}, dtype={depth_chw.dtype}")
+        
+        # Get bindings pointer list
+        bindings_ptr = [t.data_ptr() for t in self.bindings]
+        t1 = time.time()
+        
+        # Execute
+        self.context.execute_v2(bindings_ptr)
+        t2 = time.time()
+        
+        # Get outputs
+        results = {}
+        t3 = time.time()
+        for name, tensor in self.outputs.items():
+            arr = tensor.cpu().numpy()
+            # 如果是 FP16，转换为 FP32
+            if arr.dtype == np.float16:
+                arr = arr.astype(np.float32)
+            results[name] = arr
+            print(f"  Output {name}: shape={arr.shape}, min={arr.min():.4f}, max={arr.max():.4f}, mean={arr.mean():.4f}, dtype={arr.dtype}")
+        
+        print(f"Inference time: prepare {(t1-t0)*1000:.1f}ms, execute {(t2-t1)*1000:.1f}ms, total {(t3-t0)*1000:.1f}ms")
+        
+        return results
+
+
 class PyTorchModel:
     """PyTorch fallback."""
     
@@ -170,10 +250,11 @@ class PyTorchModel:
 
 def main():
     parser = argparse.ArgumentParser(description='TensorRT Inference')
-    parser.add_argument('--engine', type=str, required=True, help='Full engine path (encoder+decoder merged)')
+    parser.add_argument('--engine', type=str, help='Engine path (encoder or full model)')
+    parser.add_argument('--encoder', action='store_true', help='Use encoder-only model')
     parser.add_argument('--input', type=str, default='examples/0', help='Input directory')
     parser.add_argument('--output', type=str, default='result_trt', help='Output directory')
-    parser.add_argument('--num-runs', type=int, default=10, help='Number of runs')
+    parser.add_argument('--num-runs', type=int, default=1, help='Number of runs')
     args = parser.parse_args()
     
     input_dir = Path(args.input)
@@ -185,45 +266,69 @@ def main():
     depth_np = load_depth(str(input_dir / 'raw_depth.png'))
     print(f"Image: {image_np.shape[:2]}, Depth range: {depth_np[depth_np>0].min():.2f}-{depth_np.max():.2f}")
     
-    # Run inference
-    if TENSORRT_AVAILABLE:
-        engine = TensorRTEngine(args.engine).load()
-        times = []
-        for i in range(args.num_runs):
-            start = time.time()
+    # Run inference based on model type
+    if args.encoder:
+        # Encoder-only model
+        if args.engine and TENSORRT_AVAILABLE:
+            engine = TensorRTEncoderEngine(args.engine).load()
             results = engine.infer(image_np, depth_np)
-            times.append(time.time() - start)
-            depth_pred = results['depth_reg']
-        avg_time = sum(times) / len(times)
-        print(f"\nTensorRT: {avg_time*1000:.1f}ms avg, FPS: {1/avg_time:.1f}")
+            
+            # Save encoder outputs
+            x = results.get('x')
+            cls_token = results.get('cls_token')
+            
+            if x is not None:
+                np.save(output_dir / 'x_trt.npy', x)
+                print(f"\nEncoder x saved: {output_dir / 'x_trt.npy'}")
+                print(f"  x shape: {x.shape}")
+            
+            if cls_token is not None:
+                np.save(output_dir / 'cls_token_trt.npy', cls_token)
+                print(f"  cls_token saved: {output_dir / 'cls_token_trt.npy'}")
+                print(f"  cls_token shape: {cls_token.shape}")
+        else:
+            print("Please specify --engine for encoder model")
     else:
-        print("Using PyTorch fallback.")
-        times = []
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        image_tensor = torch.tensor(image_np, dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
-        pytorch = PyTorchModel('/home/zxw/models/lingbot-depth-pretrain-vitl-14/model.pt')
-        results = pytorch.infer(image_tensor, torch.tensor(depth_np).unsqueeze(0).cuda())
-        for i in range(args.num_runs):
-            start = time.time()
+        # Full model (encoder + decoder)
+        if TENSORRT_AVAILABLE:
+            engine = TensorRTEngine(args.engine).load()
+            times = []
+            for i in range(args.num_runs):
+                start = time.time()
+                results = engine.infer(image_np, depth_np)
+                times.append(time.time() - start)
+                depth_pred = results['depth_reg']
+            avg_time = sum(times) / len(times)
+            print(f"\nTensorRT: {avg_time*1000:.1f}ms avg, FPS: {1/avg_time:.1f}")
+        else:
+            print("Using PyTorch fallback.")
+            times = []
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            image_tensor = torch.tensor(image_np, dtype=torch.float32, device=device).permute(2, 0, 1).unsqueeze(0)
+            pytorch = PyTorchModel('/home/zxw/models/lingbot-depth-pretrain-vitl-14/model.pt')
             results = pytorch.infer(image_tensor, torch.tensor(depth_np).unsqueeze(0).cuda())
-            end = time.time()
-            print(f"Run {i+1}/{args.num_runs}: {(end - start)*1000:.1f}ms")
-            depth_pred = results['depth']
-            times.append(time.time() - start)
-        avg_time = sum(times) / len(times)
-        print(f"\nPyTorch: {avg_time*1000:.1f}ms avg, FPS: {1/avg_time:.1f}")
+            for i in range(args.num_runs):
+                start = time.time()
+                results = pytorch.infer(image_tensor, torch.tensor(depth_np).unsqueeze(0).cuda())
+                end = time.time()
+                print(f"Run {i+1}/{args.num_runs}: {(end - start)*1000:.1f}ms")
+                depth_pred = results['depth']
+                times.append(time.time() - start)
+            avg_time = sum(times) / len(times)
+            print(f"\nPyTorch: {avg_time*1000:.1f}ms avg, FPS: {1/avg_time:.1f}")
+        
+        # Save results
+        # Decoder 输出已经是 (B, H, W) 格式
+        if depth_pred.ndim == 3 and depth_pred.shape[0] == 1:
+            depth_pred = depth_pred.squeeze(0)
+        elif depth_pred.ndim == 2:
+            pass  # 已经是 (H, W)
+        else:
+            depth_pred = depth_pred.squeeze()
+        np.save(output_dir / 'depth_refined.npy', depth_pred)
+        cv2.imwrite(str(output_dir / 'depth_refined.png'), depth_to_color(depth_pred))
+        cv2.imwrite(str(output_dir / 'rgb.png'), cv2.cvtColor((image_np * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
     
-    # Save results
-    # Decoder 输出已经是 (B, H, W) 格式
-    if depth_pred.ndim == 3 and depth_pred.shape[0] == 1:
-        depth_pred = depth_pred.squeeze(0)
-    elif depth_pred.ndim == 2:
-        pass  # 已经是 (H, W)
-    else:
-        depth_pred = depth_pred.squeeze()
-    np.save(output_dir / 'depth_refined.npy', depth_pred)
-    cv2.imwrite(str(output_dir / 'depth_refined.png'), depth_to_color(depth_pred))
-    cv2.imwrite(str(output_dir / 'rgb.png'), cv2.cvtColor((image_np * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
     print(f"\nResults saved to {output_dir}")
 
 

@@ -293,6 +293,15 @@ Examples:
         print(f"\n🤖 Loading model: {args.model}")
         start_time = time.time()
         model = MDMModel.from_pretrained(args.model).to(device)
+        model.eval()
+
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        print("Total params:", total_params)
+        print("Trainable params:", trainable_params)
+        print("Total (Million): %.2f M" % (total_params / 1e6))
+
         load_time = time.time() - start_time
         print(f"   ✓ Model loaded in {load_time:.2f}s")
 

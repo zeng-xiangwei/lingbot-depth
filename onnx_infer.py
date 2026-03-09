@@ -81,6 +81,45 @@ def check_onnx_model(onnx_path: str):
         return None, None
 
 
+def infer_encoder(onnx_path: str, image_np: np.ndarray, depth_np: np.ndarray) -> Dict:
+    """Run encoder-only model inference."""
+    print(f"\n{'='*60}")
+    print("Running Encoder-Only Model Inference")
+    print('='*60)
+    
+    session = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
+    
+    # Print expected input shapes
+    for inp in session.get_inputs():
+        print(f"  Expected input: {inp.name} -> shape={inp.shape}")
+    
+    # Prepare inputs - ensure 4D shape (B, C, H, W) for ONNX
+    image_input = np.transpose(image_np, (2, 0, 1))[np.newaxis, :, :, :]  # (1, C, H, W)
+    depth_input = depth_np[np.newaxis, np.newaxis, :, :]  # (1, 1, H, W)
+    
+    inputs = {
+        'image': image_input.astype(np.float32),
+        'depth': depth_input.astype(np.float32),
+    }
+    
+    print(f"  Input image: shape={inputs['image'].shape}, min={inputs['image'].min():.4f}, max={inputs['image'].max():.4f}, mean={inputs['image'].mean():.4f}")
+    print(f"  Input depth: shape={inputs['depth'].shape}, min={inputs['depth'].min():.4f}, max={inputs['depth'].max():.4f}, mean={inputs['depth'].mean():.4f}")
+    
+    # Run
+    start = time.time()
+    outputs = session.run(None, inputs)
+    elapsed = time.time() - start
+    
+    print(f"Inference time: {elapsed*1000:.2f}ms")
+    
+    # Print outputs
+    for i, out in enumerate(session.get_outputs()):
+        arr = outputs[i]
+        print(f"  {out.name}: shape={arr.shape}, dtype={arr.dtype}, min={arr.min():.4f}, max={arr.max():.4f}, mean={arr.mean():.4f}")
+    
+    return {out.name: outputs[i] for i, out in enumerate(session.get_outputs())}
+
+
 def infer_full(onnx_path: str, image_np: np.ndarray, depth_np: np.ndarray) -> Dict:
     """Run full model inference (Encoder + Decoder merged)."""
     print(f"\n{'='*60}")
@@ -122,7 +161,8 @@ def infer_full(onnx_path: str, image_np: np.ndarray, depth_np: np.ndarray) -> Di
 
 def main():
     parser = argparse.ArgumentParser(description='ONNX Inference for LingBot-Depth')
-    parser.add_argument('--model', type=str, help='Full ONNX model path (encoder+decoder merged)')
+    parser.add_argument('--model', type=str, help='ONNX model path')
+    parser.add_argument('--encoder', action='store_true', help='Use encoder-only model')
     parser.add_argument('--input', type=str, default='examples/0', help='Input directory')
     parser.add_argument('--output', type=str, default='result_onnx', help='Output directory')
     args = parser.parse_args()
@@ -152,26 +192,47 @@ def main():
     if args.model:
         check_onnx_model(args.model)
         
-        # Run inference
-        results = infer_full(args.model, image_np, depth_np)
+        # Run inference based on model type
+        if args.encoder:
+            # Encoder-only model
+            results = infer_encoder(args.model, image_np, depth_np)
+            
+            # Save encoder outputs
+            x = results.get('x')
+            cls_token = results.get('cls_token')
+            
+            if x is not None:
+                np.save(output_dir / 'x_onnx.npy', x)
+                print(f"\nEncoder x saved: {output_dir / 'x_onnx.npy'}")
+                print(f"  x shape: {x.shape}")
+            
+            if cls_token is not None:
+                np.save(output_dir / 'cls_token_onnx.npy', cls_token)
+                print(f"  cls_token saved: {output_dir / 'cls_token_onnx.npy'}")
+                print(f"  cls_token shape: {cls_token.shape}")
+        else:
+            # Full model (encoder + decoder)
+            results = infer_full(args.model, image_np, depth_np)
+            
+            # Save results
+            depth_pred = results.get('depth_reg')
+            if depth_pred is not None:
+                if depth_pred.ndim == 3 and depth_pred.shape[0] == 1:
+                    depth_pred = depth_pred.squeeze(0)
+                elif depth_pred.ndim == 2:
+                    pass
+                else:
+                    depth_pred = depth_pred.squeeze()
+                
+                np.save(output_dir / 'depth_onnx.npy', depth_pred)
+                depth_colored = depth_to_color(depth_pred)
+                cv2.imwrite(str(output_dir / 'depth_onnx.png'), depth_colored)
+                
+                print(f"\nResults saved to {output_dir}")
+                print(f"   - depth_onnx.npy: shape={depth_pred.shape}")
+                print(f"   - depth_onnx.png: shape={depth_colored.shape}")
         
-        # Save results
-        depth_pred = results.get('depth_reg')
-        if depth_pred is not None:
-            if depth_pred.ndim == 3 and depth_pred.shape[0] == 1:
-                depth_pred = depth_pred.squeeze(0)
-            elif depth_pred.ndim == 2:
-                pass
-            else:
-                depth_pred = depth_pred.squeeze()
-            
-            np.save(output_dir / 'depth_onnx.npy', depth_pred)
-            depth_colored = depth_to_color(depth_pred)
-            cv2.imwrite(str(output_dir / 'depth_onnx.png'), depth_colored)
-            
-            print(f"\nResults saved to {output_dir}")
-            print(f"   - depth_onnx.npy: shape={depth_pred.shape}")
-            print(f"   - depth_onnx.png: shape={depth_colored.shape}")
+        print(f"\nAll outputs saved to {output_dir}")
     else:
         print("Please specify --model")
 
